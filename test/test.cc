@@ -465,6 +465,7 @@ TEST(ConnectionErrorTest, InvalidHost) {
 
   auto res = cli.Get("/");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ConnectionError, cli.get_last_error());
 }
 
 TEST(ConnectionErrorTest, InvalidHost2) {
@@ -479,6 +480,7 @@ TEST(ConnectionErrorTest, InvalidHost2) {
 
   auto res = cli.Get("/");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ConnectionError, cli.get_last_error());
 }
 
 TEST(ConnectionErrorTest, InvalidPort) {
@@ -495,6 +497,7 @@ TEST(ConnectionErrorTest, InvalidPort) {
 
   auto res = cli.Get("/");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ConnectionTimeoutError, cli.get_last_error());
 }
 
 TEST(ConnectionErrorTest, Timeout) {
@@ -511,6 +514,8 @@ TEST(ConnectionErrorTest, Timeout) {
 
   auto res = cli.Get("/");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_TRUE(cli.get_last_error() == Error::ConnectionError ||
+              cli.get_last_error() == Error::ConnectionTimeoutError);
 }
 
 TEST(CancelTest, NoCancel) {
@@ -545,6 +550,7 @@ TEST(CancelTest, WithCancelSmallPayload) {
   auto res = cli.Get("/range/32", [](uint64_t, uint64_t) { return false; });
   cli.set_connection_timeout(5);
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::Canceled, cli.get_last_error());
 }
 
 TEST(CancelTest, WithCancelLargePayload) {
@@ -563,6 +569,7 @@ TEST(CancelTest, WithCancelLargePayload) {
   auto res = cli.Get("/range/65536",
                      [&count](uint64_t, uint64_t) { return (count++ == 0); });
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::Canceled, cli.get_last_error());
 }
 
 TEST(BaseAuthTest, FromHTTPWatch) {
@@ -721,6 +728,7 @@ TEST(TooManyRedirectTest, Redirect) {
   cli.set_follow_location(true);
   auto res = cli.Get("/redirect/21");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ExceedRedirectCount, cli.get_last_error());
 }
 #endif
 
@@ -1244,6 +1252,12 @@ protected:
              [&](const Request &req, Response & /*res*/) {
                EXPECT_EQ("close", req.get_header_value("Connection"));
              })
+        .Get(R"(/redirect/(\d+))",
+             [&](const Request &req, Response &res) {
+               auto num = std::stoi(req.matches[1]) + 1;
+               std::string url = "/redirect/" + std::to_string(num);
+               res.set_redirect(url);
+             })
 #if defined(CPPHTTPLIB_ZLIB_SUPPORT) || defined(CPPHTTPLIB_BROTLI_SUPPORT)
         .Get("/compress",
              [&](const Request & /*req*/, Response &res) {
@@ -1586,6 +1600,7 @@ TEST_F(ServerTest, InvalidBaseDirMount) {
 TEST_F(ServerTest, EmptyRequest) {
   auto res = cli_.Get("");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ConnectionError, cli_.get_last_error());
 }
 
 TEST_F(ServerTest, LongRequest) {
@@ -1871,6 +1886,7 @@ TEST_F(ServerTest, GetStreamedEndless) {
                         return false;
                       });
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::Canceled, cli_.get_last_error());
 }
 
 TEST_F(ServerTest, ClientStop) {
@@ -1880,6 +1896,8 @@ TEST_F(ServerTest, ClientStop) {
       auto res = cli_.Get("/streamed-cancel",
                           [&](const char *, uint64_t) { return true; });
       ASSERT_TRUE(res == nullptr);
+      EXPECT_TRUE(cli_.get_last_error() == Error::UnknownError ||
+                  cli_.get_last_error() == Error::Canceled);
     }));
   }
 
@@ -2032,7 +2050,8 @@ TEST_F(ServerTest, SlowPost) {
       },
       "text/plain");
 
-  ASSERT_FALSE(res != nullptr);
+  ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::WriteError, cli_.get_last_error());
 }
 
 TEST_F(ServerTest, Put) {
@@ -2066,6 +2085,7 @@ TEST_F(ServerTest, PostWithContentProviderAbort) {
       "text/plain");
 
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::Canceled, cli_.get_last_error());
 }
 
 #ifdef CPPHTTPLIB_ZLIB_SUPPORT
@@ -2095,6 +2115,7 @@ TEST_F(ServerTest, PostWithContentProviderWithGzipAbort) {
       "text/plain");
 
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::Canceled, cli_.get_last_error());
 }
 
 TEST_F(ServerTest, PutLargeFileWithGzip) {
@@ -2320,6 +2341,13 @@ TEST_F(ServerTest, KeepAlive) {
   EXPECT_EQ("close", res->get_header_value("Connection"));
 }
 
+TEST_F(ServerTest, TooManyRedirect) {
+  cli_.set_follow_location(true);
+  auto res = cli_.Get("/redirect/0");
+  ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::ExceedRedirectCount, cli_.get_last_error());
+}
+
 #ifdef CPPHTTPLIB_ZLIB_SUPPORT
 TEST_F(ServerTest, Gzip) {
   Headers headers;
@@ -2387,12 +2415,11 @@ TEST_F(ServerTest, GzipWithoutDecompressing) {
 
 TEST_F(ServerTest, GzipWithContentReceiverWithoutAcceptEncoding) {
   std::string body;
-  auto res = cli_.Get("/compress",
-                      [&](const char *data, uint64_t data_length) {
-                        EXPECT_EQ(data_length, 100);
-                        body.append(data, data_length);
-                        return true;
-                      });
+  auto res = cli_.Get("/compress", [&](const char *data, uint64_t data_length) {
+    EXPECT_EQ(data_length, 100);
+    body.append(data, data_length);
+    return true;
+  });
 
   ASSERT_TRUE(res != nullptr);
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
@@ -2474,9 +2501,11 @@ TEST_F(ServerTest, Brotli) {
 // Sends a raw request to a server listening at HOST:PORT.
 static bool send_request(time_t read_timeout_sec, const std::string &req,
                          std::string *resp = nullptr) {
+  Error error = Error::None;
+
   auto client_sock =
       detail::create_client_socket(HOST, PORT, false, nullptr,
-                                   /*timeout_sec=*/5, 0, std::string());
+                                   /*timeout_sec=*/5, 0, std::string(), error);
 
   if (client_sock == INVALID_SOCKET) { return false; }
 
@@ -2965,6 +2994,7 @@ TEST(SSLClientTest, ServerCertificateVerification2) {
   cli.set_ca_cert_path("hello");
   auto res = cli.Get("/");
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::SSLLoadingCertsError, cli.get_last_error());
 }
 
 TEST(SSLClientTest, ServerCertificateVerification3) {
@@ -3119,6 +3149,7 @@ TEST(SSLClientServerTest, ClientCertMissing) {
   auto res = cli.Get("/test");
   cli.set_connection_timeout(30);
   ASSERT_TRUE(res == nullptr);
+  EXPECT_EQ(Error::SSLServerVerificationError, cli.get_last_error());
 
   svr.stop();
 
@@ -3167,6 +3198,7 @@ TEST(CleanupTest, WSACleanup) {
 TEST(InvalidScheme, SimpleInterface) {
   Client cli("scheme://yahoo.com");
   ASSERT_FALSE(cli.is_valid());
+  EXPECT_EQ(Error::ConnectionError, cli.get_last_error());
 }
 
 TEST(NoScheme, SimpleInterface) {
