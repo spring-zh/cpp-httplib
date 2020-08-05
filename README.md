@@ -496,6 +496,26 @@ httplib::make_range_header({{100, 199}, {500, 599}}) // 'Range: bytes=100-199, 5
 httplib::make_range_header({{0, 0}, {-1, 1}})        // 'Range: bytes=0-0, -1'
 ```
 
+### Real Stream
+
+```cpp
+    httplib::Client cli("httpbin.org");
+    cli.set_keep_alive(true);
+
+    int count = 3;
+    do {
+        std::shared_ptr<httplib::Stream> stream;
+        std::shared_ptr<httplib::Response> res = cli.Get("/range", {httplib::make_range_header({{1*count, 10*count}})}, stream);
+        if (res && (res->status >= 200 && res->status <= 206)) {
+            uint8_t body_buffer[4096];
+               ssize_t len = stream->read((char*)body_buffer, sizeof(body_buffer));
+          std::cout << body_buffer << std::endl;
+        }
+    }while (--count);
+    
+    cli.stop();
+```
+
 ### Keep-Alive connection
 
 ```cpp
