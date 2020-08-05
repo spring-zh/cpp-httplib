@@ -716,6 +716,11 @@ public:
                                 ResponseHandler response_handler,
                                 ContentReceiver content_receiver,
                                 Progress progress);
+  //add by zsp
+  std::shared_ptr<Response> Get(const char *path,
+                                  std::shared_ptr<Stream>& content_stream);
+  std::shared_ptr<Response> Get(const char *path, const Headers &headers,
+                                  std::shared_ptr<Stream>& content_stream);
 
   std::shared_ptr<Response> Head(const char *path);
   std::shared_ptr<Response> Head(const char *path, const Headers &headers);
@@ -783,6 +788,7 @@ public:
   std::shared_ptr<Response> Options(const char *path, const Headers &headers);
 
   bool send(const Request &req, Response &res);
+  bool send(const Request &req, Response &res, std::shared_ptr<Stream>& content_stream);
 
   size_t is_socket_open() const;
 
@@ -892,6 +898,7 @@ protected:
 #endif
 
   Logger logger_;
+  bool use_content_stream_;
 
   void copy_settings(const ClientImpl &rhs) {
     client_cert_path_ = rhs.client_cert_path_;
@@ -942,6 +949,8 @@ private:
 
   virtual bool process_socket(Socket &socket,
                               std::function<bool(Stream &strm)> callback);
+  virtual bool process_socket(Socket &socket,
+                              std::shared_ptr<Stream>& content_stream);
   virtual bool is_ssl() const;
 };
 
@@ -993,6 +1002,11 @@ public:
                                 ResponseHandler response_handler,
                                 ContentReceiver content_receiver,
                                 Progress progress);
+    //add by zsp
+  std::shared_ptr<Response> Get(const char *path,
+                                std::shared_ptr<Stream>& content_stream);
+  std::shared_ptr<Response> Get(const char *path, const Headers &headers,
+                                std::shared_ptr<Stream>& content_stream);
 
   std::shared_ptr<Response> Head(const char *path);
   std::shared_ptr<Response> Head(const char *path, const Headers &headers);
@@ -1058,6 +1072,7 @@ public:
   std::shared_ptr<Response> Options(const char *path, const Headers &headers);
 
   bool send(const Request &req, Response &res);
+  bool send(const Request &req, Response &res, std::shared_ptr<Stream>& content_stream);
 
   size_t is_socket_open() const;
 
@@ -2601,22 +2616,22 @@ bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
       x, status, receiver, decompress, [&](ContentReceiver &out) {
         auto ret = true;
         auto exceed_payload_max_length = false;
-
-        if (is_chunked_transfer_encoding(x.headers)) {
-          ret = read_content_chunked(strm, out);
-        } else if (!has_header(x.headers, "Content-Length")) {
-          ret = read_content_without_length(strm, out);
-        } else {
-          auto len = get_header_value<uint64_t>(x.headers, "Content-Length");
-          if (len > payload_max_length) {
-            exceed_payload_max_length = true;
-            skip_content_with_length(strm, len);
-            ret = false;
-          } else if (len > 0) {
-            ret = read_content_with_length(strm, len, progress, out);
-          }
+        if(receiver) {
+            if (is_chunked_transfer_encoding(x.headers)) {
+              ret = read_content_chunked(strm, out);
+            } else if (!has_header(x.headers, "Content-Length")) {
+              ret = read_content_without_length(strm, out);
+            } else {
+              auto len = get_header_value<uint64_t>(x.headers, "Content-Length");
+              if (len > payload_max_length) {
+                exceed_payload_max_length = true;
+                skip_content_with_length(strm, len);
+                ret = false;
+              } else if (len > 0) {
+                ret = read_content_with_length(strm, len, progress, out);
+              }
+            }
         }
-
         if (!ret) { status = exceed_payload_max_length ? 413 : 400; }
         return ret;
       });
@@ -4494,7 +4509,7 @@ inline ClientImpl::ClientImpl(const std::string &host, int port,
                               const std::string &client_key_path)
     : host_(host), port_(port),
       host_and_port_(host_ + ":" + std::to_string(port_)),
-      client_cert_path_(client_cert_path), client_key_path_(client_key_path) {}
+      client_cert_path_(client_cert_path), client_key_path_(client_key_path), use_content_stream_(false) {}
 
 inline ClientImpl::~ClientImpl() { stop(); }
 
@@ -4586,6 +4601,47 @@ inline bool ClientImpl::send(const Request &req, Response &res) {
   if (close_connection || !ret) { stop(); }
 
   return ret;
+}
+
+inline bool ClientImpl::send(const Request &req, Response &res, std::shared_ptr<Stream>& content_stream) {
+    std::lock_guard<std::recursive_mutex> request_mutex_guard(request_mutex_);
+
+      {
+        std::lock_guard<std::mutex> guard(socket_mutex_);
+
+        auto is_alive = false;
+        if (socket_.is_open()) {
+          is_alive = detail::select_write(socket_.sock, 0, 0) > 0;
+          if (!is_alive) { close_socket(socket_, false); }
+        }
+
+        if (!is_alive) {
+          if (!create_and_connect_socket(socket_)) { return false; }
+
+    #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+          // TODO: refactoring
+          if (is_ssl()) {
+            auto &scli = static_cast<SSLClient &>(*this);
+            if (!proxy_host_.empty()) {
+              bool success = false;
+              if (!scli.connect_with_proxy(socket_, res, success)) {
+                return success;
+              }
+            }
+
+            if (!scli.initialize_ssl(socket_)) { return false; }
+          }
+    #endif
+        }
+      }
+
+      auto close_connection = !keep_alive_;
+
+    auto ret = process_socket(socket_, content_stream);
+    
+    ret = handle_request(*content_stream.get(), req, res, close_connection);
+
+    return ret;
 }
 
 inline bool ClientImpl::handle_request(Stream &strm, const Request &req,
@@ -4905,7 +4961,7 @@ inline bool ClientImpl::process_request(Stream &strm, const Request &req,
 
     int dummy_status;
     if (!detail::read_content(strm, res, (std::numeric_limits<size_t>::max)(),
-                              dummy_status, req.progress, out, decompress_)) {
+                              dummy_status, req.progress, use_content_stream_?nullptr:out, decompress_)) {
       return false;
     }
   }
@@ -4927,6 +4983,14 @@ ClientImpl::process_socket(Socket &socket,
   return detail::process_client_socket(socket.sock, read_timeout_sec_,
                                        read_timeout_usec_, write_timeout_sec_,
                                        write_timeout_usec_, callback);
+}
+inline bool
+ClientImpl::process_socket(Socket &socket,
+                           std::shared_ptr<Stream>& content_stream) {
+    content_stream = std::shared_ptr<Stream>(new detail::SocketStream(socket.sock, read_timeout_sec_,
+                                             read_timeout_usec_, write_timeout_sec_,
+                                             write_timeout_usec_));
+    return true;
 }
 
 inline bool ClientImpl::is_ssl() const { return false; }
@@ -5020,6 +5084,27 @@ ClientImpl::Get(const char *path, const Headers &headers,
 
   auto res = std::make_shared<Response>();
   return send(req, *res) ? res : nullptr;
+}
+
+inline std::shared_ptr<Response> ClientImpl::Get(const char *path,
+                                             std::shared_ptr<Stream>& content_stream) {
+    return Get(path, Headers(),content_stream);
+}
+inline std::shared_ptr<Response> ClientImpl::Get(const char *path, const Headers &headers,
+                                             std::shared_ptr<Stream>& content_stream) {
+    Request req;
+    req.method = "GET";
+    req.path = path;
+    req.headers = default_headers_;
+    req.headers.insert(headers.begin(), headers.end());
+    req.response_handler = nullptr;
+    req.content_receiver = nullptr;
+    req.progress = nullptr;
+    
+    use_content_stream_ = true;
+
+    auto res = std::make_shared<Response>();
+    return send(req, *res, content_stream) ? res : nullptr;
 }
 
 inline std::shared_ptr<Response> ClientImpl::Head(const char *path) {
@@ -6072,6 +6157,15 @@ inline std::shared_ptr<Response> Client::Get(const char *path,
   return cli_->Get(path, headers, response_handler, content_receiver, progress);
 }
 
+inline std::shared_ptr<Response> Client::Get(const char *path,
+                                             std::shared_ptr<Stream>& content_stream) {
+    return cli_->Get(path, content_stream);
+}
+inline std::shared_ptr<Response> Client::Get(const char *path, const Headers &headers,
+                                             std::shared_ptr<Stream>& content_stream) {
+    return cli_->Get(path, headers, content_stream);
+}
+
 inline std::shared_ptr<Response> Client::Head(const char *path) {
   return cli_->Head(path);
 }
@@ -6208,6 +6302,10 @@ inline std::shared_ptr<Response> Client::Options(const char *path,
 
 inline bool Client::send(const Request &req, Response &res) {
   return cli_->send(req, res);
+}
+
+inline bool Client::send(const Request &req, Response &res, std::shared_ptr<Stream>& content_stream) {
+    return cli_->send(req, res, content_stream);
 }
 
 inline size_t Client::is_socket_open() const { return cli_->is_socket_open(); }
